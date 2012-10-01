@@ -1,14 +1,36 @@
 (ns barrister.core
   (:require [clojure.string]
+            [cheshire.core]
             [clojure.tools.logging :as log])
   (:use [slingshot.slingshot :only [try+]]))
 
 ;;(defmacro dbg[x] `(let [x# ~x] (println '~x "=" x#) x#))
 
-;; (defn load-contract [json]
-;;   (cheshire.core/parse-string json))
-
 (declare validate-field)
+
+(defn load-contract [json]
+  (cheshire.core/parse-string json))
+
+(defn comment-to-idl [s] 
+  (map #(str "// " %) (filter #(not= "" %) (clojure.string/split s #"\n"))))
+
+(defn enum-to-idl [e]
+  (let [vals (map #(str "    " (get % "value")) (get e "values"))]
+    (flatten
+     [ (comment-to-idl (get e "comment"))
+       (str "enum " (get e "name") " {") 
+       vals 
+       "}" ])))
+
+(defn elem-to-idl [e]
+  (flatten 
+   (condp = (get e "type")
+     "comment" (comment-to-idl (get e "value"))
+     "enum"    (enum-to-idl e)
+     "")))
+
+(defn contract-to-idl [c]
+  (clojure.string/join "\n" (flatten (map #(elem-to-idl %) c))))
 
 (defn first-not-nil [s]
   (first (filter #(not (nil? %)) s)))
@@ -139,16 +161,16 @@
 
 (defn create-rpc-resp
   ([req result]
-     { "id" (get req "id") "result" result })
+     { "jsonrpc" "2.0" "id" (get req "id") "result" result })
   ([req code msg] 
      (if-not (nil? msg)
-       { "id" (get req "id") "error" { "code" code "message" msg } }))
+       { "jsonrpc" "2.0" "id" (get req "id") "error" { "code" code "message" msg } }))
   ([req code msg data]
      (let [err (create-rpc-resp req code msg)]
        (if-not (nil? err) (assoc-in err ["error" "data"] data)))))
 
 (defn create-rpc-req [method params]
-  { "id" (.toString (java.util.UUID/randomUUID)) "method" method "params" params })
+  { "jsonrpc" "2.0" "id" (.toString (java.util.UUID/randomUUID)) "method" method "params" params })
 
 ;; from: http://stackoverflow.com/questions/1696693/clojure-how-to-find-out-the-arity-of-function-at-runtime
 (defn get-arity [f]
@@ -179,7 +201,7 @@
       (create-rpc-resp req result)
       (create-rpc-resp req -32001 err))))
 
-(defn invoke-one [c handlers req]
+(defn invoke-handler [c handlers req ctx]
   (let [method  (get req "method")
         func    (if-not (nil? method) (get-meth c method))
         params  (if-not (nil? func)   (get req "params"))
@@ -191,14 +213,36 @@
       :else (eval-until-not-nil
              [ #(create-rpc-resp req -32602 (validate-params c func params))
                #(try+
-                  (validate-result c func req (apply handler params))
+                  (if (nil? ctx)
+                    (validate-result c func req (apply handler params))
+                    (validate-result c func req (apply handler (conj params ctx))))
                   (catch [:type :rpc-err] {:keys [code message data]} (create-rpc-resp req code message data))
                   (catch Object _
                     (let [msg (str "Unexpected error executing: " method)]
                       (log/error (:throwable &throw-context) msg)
                       (create-rpc-resp req -32000 msg)))) ]))))
 
-(defn invoke [c handlers req]
-  (if (sequential? req)
-    (map #(invoke-one c handlers %) req)
-    (invoke-one c handlers req)))
+(defn invoke-one [c handlers req ctx]
+  (let [method  (get req "method")]
+    (if (= "barrister-idl" method)
+      (create-rpc-resp req c)
+      (invoke-handler c handlers req ctx))))
+
+(defn invoke 
+  ([c handlers req] (invoke c handlers req nil))
+  ([c handlers req ctx]
+     (if (sequential? req)
+       (map #(invoke-one c handlers % ctx) req)
+       (invoke-one c handlers req ctx))))
+
+(defn invoke-json 
+  ([c handlers s] (invoke-json c handlers s nil))
+  ([c handlers s ctx]
+     (try
+       (cheshire.core/generate-string 
+        (invoke c handlers (cheshire.core/parse-string s) ctx) {:escape-non-ascii true})
+       (catch com.fasterxml.jackson.core.JsonParseException _
+         (create-rpc-resp nil -32700 "Unable to parse request JSON")))))
+
+
+    
