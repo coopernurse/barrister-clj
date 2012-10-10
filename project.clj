@@ -3,7 +3,8 @@
   :dev-dependencies [[lein-marginalia "0.7.1"]
                      [criterium "0.3.0"]]
   :dependencies [[org.clojure/clojure "1.3.0"]
-                 [cheshire "4.0.2"]
                  [org.clojure/tools.logging "0.2.3"]
+                 [clj-http "0.5.5"]
+                 [cheshire "4.0.3"]
                  [slingshot "0.10.3"]])
 

@@ -2,30 +2,36 @@
   (:require [clojure.string]
             [cheshire.core]
             [clojure.tools.logging :as log])
-  (:use [slingshot.slingshot :only [try+]]))
+  (:use [slingshot.slingshot :only [try+ throw+]]))
 
 ;;(defmacro dbg[x] `(let [x# ~x] (println '~x "=" x#) x#))
 
 (declare validate-field)
 
+(defn throw-err 
+  ([err] (throw-err (:code err) (:message err) (:data err)))
+  ([code msg] (throw-err code msg nil))
+  ([code msg data]
+     (throw+ {:type :rpc-err :code code :message msg :data data })))
+
 (defn load-contract [json]
-  (cheshire.core/parse-string json))
+  (cheshire.core/parse-string json true))
 
 (defn comment-to-idl [s] 
   (map #(str "// " %) (filter #(not= "" %) (clojure.string/split s #"\n"))))
 
 (defn enum-to-idl [e]
-  (let [vals (map #(str "    " (get % "value")) (get e "values"))]
+  (let [vals (map #(str "    " (:value %)) (:values e))]
     (flatten
-     [ (comment-to-idl (get e "comment"))
-       (str "enum " (get e "name") " {") 
+     [ (comment-to-idl (:comment e))
+       (str "enum " (:name e) " {") 
        vals 
        "}" ])))
 
 (defn elem-to-idl [e]
   (flatten 
-   (condp = (get e "type")
-     "comment" (comment-to-idl (get e "value"))
+   (condp = (:type e)
+     "comment" (comment-to-idl (:value e))
      "enum"    (enum-to-idl e)
      "")))
 
@@ -46,13 +52,13 @@
         out))))
 
 (defn all-elem [c type]
-  (filter #(= type (get % "type")) c))
+  (filter #(= type (:type %)) c))
 
 (defn all-interfaces [c]
   (all-elem c "interface"))
   
 (defn get-elem [c name type]
-  (first (filter #(and (= type (get % "type")) (= name (get % "name"))) c)))
+  (first (filter #(and (= type (:type %)) (= name (:name %))) c)))
 
 (defn get-struct [c name]
   (get-elem c name "struct"))
@@ -61,7 +67,7 @@
   (get-elem c name "enum"))
 
 (defn get-enum-vals [c name]
-  (map #(get % "value") (get (get-enum c name) "values")))
+  (map #(:value %) (:values (get-enum c name))))
 
 (defn get-interface [c name]
   (get-elem c name "interface"))
@@ -70,8 +76,8 @@
   (clojure.string/split m #"\."))
 
 (defn get-function [c iface func]
-  (first (filter #(= func (get % "name")) 
-                 (get (get-interface c iface) "functions"))))
+  (first (filter #(= func (:name %)) 
+                 (:functions (get-interface c iface)))))
 
 (defn get-meth [c name]
   (let [m (parse-method name)]
@@ -79,7 +85,7 @@
 
 (defn all-functions [c]
   (let [ifaces (all-elem c "interface")]
-    (reduce conj (map #(get % "functions") ifaces))))
+    (reduce conj (map #(:functions %) ifaces))))
 
 (defn is-bool? [val]
   (instance? Boolean val))
@@ -91,12 +97,12 @@
   (or (instance? Double val) (instance? Float val) (is-int? val)))
 
 (defn struct-field-map [c struct]
-  (let [f (get struct "fields")
-        parent (get-struct c (get struct "extends"))
+  (let [f (:fields struct)
+        parent (get-struct c (:extends struct))
         parent-map (if (nil? parent) {} (struct-field-map c parent))]
     (if (nil? f)
       {}
-      (apply assoc (cons parent-map (interleave (map #(get % "name") f) f))))))
+      (apply assoc (cons parent-map (interleave (map #(:name %) f) f))))))
 
 (defn validate-prim [msg valid expect-type val]
   (if-not valid (str msg "is type '" (type val) "' not " expect-type)))
@@ -104,18 +110,18 @@
 (defn validate-struct [msg c struct val]
   (let [f (struct-field-map c struct)]
     (if (map? val)
-      (first-not-nil (map #(validate-field msg c (get f %) (get val %)) (keys f)))
-      (str msg "'" val "' is type '" (type val) "' not " (get struct "name")))))
+      (first-not-nil (map #(validate-field msg c (% f) (% val)) (keys f)))
+      (str msg "'" val "' is type '" (type val) "' not " (:name struct)))))
 
 (defn validate-enum [msg c elem val]
-  (let [vals (set (map #(get % "value") (get elem "values")))
-        name (get elem "name")]
+  (let [vals (set (map #(:value %) (:values elem)))
+        name (:name elem)]
     (if-not (contains? vals val)
       (str msg "'" val "' is not in enum " name " (valid values: " (clojure.string/join ", " vals) ")"))))
 
 (defn validate-cust-type [msg c expect-type val]
   (let [elem (eval-until-not-nil [#(get-struct c expect-type) #(get-enum c expect-type)])]
-    (case (get elem "type")
+    (case (:type elem)
       "struct" (validate-struct msg c elem val)
       "enum"   (validate-enum msg c elem val)
       (str msg "unknown type: " expect-type))))
@@ -135,10 +141,10 @@
       )))
 
 (defn validate-field [msg c field val]
-  (let [type (get field "type")
-        name (get field "name")
-        optional? (get field "optional")
-        expect-arr (get field "is_array")
+  (let [type (:type field)
+        name (:name field)
+        optional? (:optional field)
+        expect-arr (:is_array field)
         msg (str msg name " ")]
     (if (not= (sequential? val) expect-arr)
       ;; array type mismatch
@@ -151,26 +157,34 @@
         (validate-type msg c type optional? val)))))
 
 (defn validate-params [c func params]
-  (let [f-params (get func "params")
-        f-name   (get func "name")]
+  (let [f-params (:params func)
+        f-name   (:name func)]
     (if (nil? func)
       (str "Function is undefined")
       (if (= (count f-params) (count params))
         (first-not-nil (map #(validate-field (str "Function '" f-name "' param ") c %1 %2) f-params params))
         (str "Function '" f-name "' expects " (count f-params) " param(s) but received " (count params))))))
 
+(defn validate-rpc-req [c req]
+  (let [ func (if-not (nil? (:method req)) (get-meth c (:method req)))
+         vres (if-not (nil? func) (validate-params c func (:params req))) ]
+    (cond
+      (nil? func)    (create-rpc-resp req -32601 (str "Unknown method: " (:method req)))
+      (string? vres) (create-rpc-resp req -32602 vres)
+      :else nil)))
+
 (defn create-rpc-resp
   ([req result]
-     { "jsonrpc" "2.0" "id" (get req "id") "result" result })
+     { :jsonrpc "2.0" :id (:id req) :result result })
   ([req code msg] 
      (if-not (nil? msg)
-       { "jsonrpc" "2.0" "id" (get req "id") "error" { "code" code "message" msg } }))
+       { :jsonrpc "2.0" :id (:id req) :error { :code code :message msg } }))
   ([req code msg data]
      (let [err (create-rpc-resp req code msg)]
-       (if-not (nil? err) (assoc-in err ["error" "data"] data)))))
+       (if-not (nil? err) (assoc-in err [:error :data] data)))))
 
 (defn create-rpc-req [method params]
-  { "jsonrpc" "2.0" "id" (.toString (java.util.UUID/randomUUID)) "method" method "params" params })
+  { :jsonrpc "2.0" :id (.toString (java.util.UUID/randomUUID)) :method method :params params })
 
 ;; from: http://stackoverflow.com/questions/1696693/clojure-how-to-find-out-the-arity-of-function-at-runtime
 (defn get-arity [f]
@@ -179,9 +193,9 @@
     (alength p)))
 
 (defn validate-handler [c iface func handlers]
-  (let [method (str (get iface "name") "." (get func "name"))
+  (let [method (str (:name iface) "." (:name func))
         h (get handlers method)
-        param-count (count (get func "params"))
+        param-count (count (:params func))
         h-arity (if-not (nil? h) (get-arity h))]
     (cond 
       (nil? h) (str "No handler defined for method: " method)
@@ -189,22 +203,22 @@
       :else nil)))
 
 (defn validate-interface-handlers [c iface handlers]
-  (filter string? (map #(validate-handler c iface % handlers) (get iface "functions"))))
+  (filter string? (map #(validate-handler c iface % handlers) (:functions iface))))
 
 (defn validate-handlers [c handlers]
   (flatten (map #(validate-interface-handlers c % handlers) (all-interfaces c))))
 
 (defn validate-result [c func req result]
-  (let [name (str (get req "method") " return value")
-        err  (validate-field name c (get func "returns") result)]
+  (let [name (str (:method req) " return value")
+        err  (validate-field name c (:returns func) result)]
     (if (nil? err)
       (create-rpc-resp req result)
       (create-rpc-resp req -32001 err))))
 
 (defn invoke-handler [c handlers req ctx]
-  (let [method  (get req "method")
+  (let [method  (:method req)
         func    (if-not (nil? method) (get-meth c method))
-        params  (if-not (nil? func)   (get req "params"))
+        params  (if-not (nil? func)   (:params req))
         handler (if-not (nil? method) (get handlers method))]
     (cond
       (nil? method)  (create-rpc-resp req -32600 "req missing 'method' property")
@@ -223,7 +237,7 @@
                       (create-rpc-resp req -32000 msg)))) ]))))
 
 (defn invoke-one [c handlers req ctx]
-  (let [method  (get req "method")]
+  (let [method  (:method req)]
     (if (= "barrister-idl" method)
       (create-rpc-resp req c)
       (invoke-handler c handlers req ctx))))

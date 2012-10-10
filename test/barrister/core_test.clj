@@ -5,7 +5,7 @@
   (:use [clojure.test])
   (:use [slingshot.slingshot :only [throw+]]))
 
-(def c (cheshire.core/parse-string (slurp "test/conform.json")))
+(def c (barrister.core/load-contract (slurp "test/conform.json")))
 (def h { "A.add" (fn [a b] (+ a b)) 
          "A.calc" (fn [nums op]
                     (throw+ {:type :rpc-err :code 30202 :message "blah.."})) })
