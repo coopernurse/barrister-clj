@@ -1,18 +1,15 @@
 (ns barrister.core
   (:require [clojure.string]
             [cheshire.core]
-            [clojure.tools.logging :as log])
+            [clojure.tools.logging :as log]
+            [clj-http.client :as http])
   (:use [slingshot.slingshot :only [try+ throw+]]))
-
-;;(defmacro dbg[x] `(let [x# ~x] (println '~x "=" x#) x#))
 
 (declare validate-field)
 
-(defn throw-err 
-  ([err] (throw-err (:code err) (:message err) (:data err)))
-  ([code msg] (throw-err code msg nil))
-  ([code msg data]
-     (throw+ {:type :rpc-err :code code :message msg :data data })))
+;;----------------------------------
+;;  IDL Contract Funcs
+;;----------------------------------
 
 (defn load-contract [json]
   (cheshire.core/parse-string json true))
@@ -37,19 +34,6 @@
 
 (defn contract-to-idl [c]
   (clojure.string/join "\n" (flatten (map #(elem-to-idl %) c))))
-
-(defn first-not-nil [s]
-  (first (filter #(not (nil? %)) s)))
-
-(defn eval-until-not-nil [fn-seq]
-  (loop [f (first fn-seq)
-         remain (rest fn-seq)]
-    (let [out (if-not (nil? f) (f))]
-      (if (nil? out)
-        (if (empty? remain)
-          nil
-          (recur (first remain) (rest remain)))
-        out))))
 
 (defn all-elem [c type]
   (filter #(= type (:type %)) c))
@@ -87,6 +71,58 @@
   (let [ifaces (all-elem c "interface")]
     (reduce conj (map #(:functions %) ifaces))))
 
+;;----------------------------------
+;;  JSON-RPC request / response
+;;----------------------------------
+
+(defn create-rpc-resp
+  ([req result]
+     { :jsonrpc "2.0" :id (:id req) :result result })
+  ([req code msg] 
+     (if-not (nil? msg)
+       { :jsonrpc "2.0" :id (:id req) :error { :code code :message msg } }))
+  ([req code msg data]
+     (let [err (create-rpc-resp req code msg)]
+       (if-not (nil? err) (assoc-in err [:error :data] data)))))
+
+(defn create-rpc-req [method params]
+  { :jsonrpc "2.0" :id (.toString (java.util.UUID/randomUUID)) :method method :params params })
+
+(defn throw-err 
+  ([err] (throw-err (:code err) (:message err) (:data err)))
+  ([code msg] (throw-err code msg nil))
+  ([code msg data]
+     (throw+ {:type :rpc-err :code code :message msg :data data })))
+
+(defn handle-resp [resp]
+  (cond
+    (not (nil? (:error resp))) (throw-err (:error resp))
+    (not (nil? (:result resp))) (:result resp)
+    :else (throw-err -32000 (str "Invalid JSON-RPC response: " (cheshire.core/generate-string resp)))))
+
+;;----------------------------------
+;;  Validation
+;;----------------------------------
+
+;; from: http://stackoverflow.com/questions/1696693/clojure-how-to-find-out-the-arity-of-function-at-runtime
+(defn get-arity [f]
+  (let [m (first (.getDeclaredMethods (class f)))
+        p (.getParameterTypes m)]
+    (alength p)))
+
+(defn first-not-nil [s]
+  (first (filter #(not (nil? %)) s)))
+
+(defn eval-until-not-nil [fn-seq]
+  (loop [f (first fn-seq)
+         remain (rest fn-seq)]
+    (let [out (if-not (nil? f) (f))]
+      (if (nil? out)
+        (if (empty? remain)
+          nil
+          (recur (first remain) (rest remain)))
+        out))))
+
 (defn is-bool? [val]
   (instance? Boolean val))
 
@@ -119,7 +155,7 @@
     (if-not (contains? vals val)
       (str msg "'" val "' is not in enum " name " (valid values: " (clojure.string/join ", " vals) ")"))))
 
-(defn validate-cust-type [msg c expect-type val]
+(defn validate-struct-or-enum [msg c expect-type val]
   (let [elem (eval-until-not-nil [#(get-struct c expect-type) #(get-enum c expect-type)])]
     (case (:type elem)
       "struct" (validate-struct msg c elem val)
@@ -137,8 +173,7 @@
       "int"    (validate-prim msg (is-int? val)   expect-type val)
       "float"  (validate-prim msg (is-float? val) expect-type val)
       "bool"   (validate-prim msg (is-bool? val)  expect-type val)
-      (validate-cust-type msg c expect-type val)
-      )))
+      (validate-struct-or-enum msg c expect-type val))))
 
 (defn validate-field [msg c field val]
   (let [type (:type field)
@@ -173,25 +208,6 @@
       (string? vres) (create-rpc-resp req -32602 vres)
       :else nil)))
 
-(defn create-rpc-resp
-  ([req result]
-     { :jsonrpc "2.0" :id (:id req) :result result })
-  ([req code msg] 
-     (if-not (nil? msg)
-       { :jsonrpc "2.0" :id (:id req) :error { :code code :message msg } }))
-  ([req code msg data]
-     (let [err (create-rpc-resp req code msg)]
-       (if-not (nil? err) (assoc-in err [:error :data] data)))))
-
-(defn create-rpc-req [method params]
-  { :jsonrpc "2.0" :id (.toString (java.util.UUID/randomUUID)) :method method :params params })
-
-;; from: http://stackoverflow.com/questions/1696693/clojure-how-to-find-out-the-arity-of-function-at-runtime
-(defn get-arity [f]
-  (let [m (first (.getDeclaredMethods (class f)))
-        p (.getParameterTypes m)]
-    (alength p)))
-
 (defn validate-handler [c iface func handlers]
   (let [method (str (:name iface) "." (:name func))
         h (get handlers method)
@@ -215,6 +231,10 @@
       (create-rpc-resp req result)
       (create-rpc-resp req -32001 err))))
 
+;;----------------------------------
+;;  Server Dispatch
+;;----------------------------------
+
 (defn invoke-handler [c handlers req ctx]
   (let [method  (:method req)
         func    (if-not (nil? method) (get-meth c method))
@@ -236,27 +256,52 @@
                       (log/error (:throwable &throw-context) msg)
                       (create-rpc-resp req -32000 msg)))) ]))))
 
-(defn invoke-one [c handlers req ctx]
+(defn dispatch-one [c handlers req ctx]
   (let [method  (:method req)]
     (if (= "barrister-idl" method)
       (create-rpc-resp req c)
       (invoke-handler c handlers req ctx))))
 
-(defn invoke 
-  ([c handlers req] (invoke c handlers req nil))
+(defn dispatch-req
+  ([c handlers req] (dispatch-req c handlers req nil))
   ([c handlers req ctx]
      (if (sequential? req)
-       (map #(invoke-one c handlers % ctx) req)
-       (invoke-one c handlers req ctx))))
+       (map #(dispatch-one c handlers % ctx) req)
+       (dispatch-one c handlers req ctx))))
 
-(defn invoke-json 
-  ([c handlers s] (invoke-json c handlers s nil))
+(defn dispatch-req-str
+  ([c handlers s] (dispatch-req-str c handlers s nil))
   ([c handlers s ctx]
      (try
        (cheshire.core/generate-string 
-        (invoke c handlers (cheshire.core/parse-string s) ctx) {:escape-non-ascii true})
+        (dispatch-req c handlers (cheshire.core/parse-string s) ctx) {:escape-non-ascii true})
        (catch com.fasterxml.jackson.core.JsonParseException _
          (create-rpc-resp nil -32700 "Unable to parse request JSON")))))
 
+;;----------------------------------
+;;  Client
+;;----------------------------------
 
-    
+(defn call [method params contract trans]
+  (let [ req        (create-rpc-req method params)
+         valid-resp (validate-rpc-req contract req)
+         rpc-resp   (if (nil? valid-resp) (trans req) valid-resp) ]
+    (handle-resp rpc-resp)))
+
+(defn call-load-contract [trans]
+  (let [ req      (create-rpc-req "barrister-idl" [ ])
+         rpc-resp (trans req) ]
+  (handle-resp rpc-resp))) 
+
+(defn http-req 
+  ([method params url opts] (http-req (create-rpc-req method params) url opts))
+  ([req url opts]
+     (let [ body (cheshire.core/generate-string req {:escape-non-ascii true}) 
+            resp (http/post url (assoc opts :body body)) ]
+       (cheshire.core/parse-string (:body resp) true))))
+
+(defn make-http-trans 
+  ([url] (make-http-trans url { }))
+  ([url opts]
+     (fn [req]
+       (http-req req url opts))))
