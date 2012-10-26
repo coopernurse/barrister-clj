@@ -12,6 +12,9 @@
 ;;----------------------------------
 
 (defn load-contract [json]
+  "Accepts a JSON encoded string and parses it into map.
+   The return value may be used as the contract param to other functions
+   in this package."
   (cheshire.core/parse-string json true))
 
 (defn comment-to-idl [s] 
@@ -23,13 +26,41 @@
      [ (comment-to-idl (:comment e))
        (str "enum " (:name e) " {") 
        vals 
-       "}" ])))
+       "}" "" ])))
+
+(defn field-to-idl [f]
+  (let [ arr      (if (:is_array f) "[]" "")
+         optional (if (:optional f) " [optional]" "") ]
+    (str (:name f) " " arr (:type f) optional)))
+
+(defn struct-to-idl [e]
+  (let [ extends (if (> (count (:extends e)) 0) (str " extends " (:extends e)) "")
+         fields  (map #(str "    " (field-to-idl %)) (:fields e)) ]
+    (flatten
+     [ (comment-to-idl (:comment e))
+       (str "struct " (:name e) extends " {")
+       fields
+       "}" "" ])))
+
+(defn func-to-idl [f]
+  (let [ params (clojure.string/join ", " (map field-to-idl (:params f))) ]
+    (str (:name f) "(" params ")" (field-to-idl (:returns f)))))
+
+(defn interface-to-idl [e]
+  (let [ funcs (map #(str "    " (func-to-idl %)) (:functions e)) ]
+    (flatten
+     [ (comment-to-idl (:comment e))
+       (str "interface " (:name e) " {")
+       funcs
+       "}" "" ])))
 
 (defn elem-to-idl [e]
   (flatten 
    (condp = (:type e)
-     "comment" (comment-to-idl (:value e))
-     "enum"    (enum-to-idl e)
+     "comment"   (comment-to-idl (:value e))
+     "enum"      (enum-to-idl e)
+     "struct"    (struct-to-idl e)
+     "interface" (interface-to-idl e)
      "")))
 
 (defn contract-to-idl [c]

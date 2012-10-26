@@ -10,9 +10,9 @@
          "A.calc" (fn [nums op]
                     (throw+ {:type :rpc-err :code 30202 :message "blah.."})) })
 
-(deftest bench-invoke
-  (is (= 65 (get (invoke c h (create-rpc-req "A.add" [32 33])) "result")))
-  (criterium.core/quick-bench (invoke c h (create-rpc-req "A.add" [32 33]))))
+(deftest bench-dispatch
+  (is (= 65 (:result (dispatch-req c h (create-rpc-req "A.add" [32 33])))))
+  (criterium.core/quick-bench (dispatch-req c h (create-rpc-req "A.add" [32 33]))))
 
 ;;(deftest can-load-contract
 ;;  (let [c (cheshire.core/parse-string (slurp "test/conform.json"))]
